@@ -2,6 +2,7 @@
 import os
 import random
 import time
+from datetime import datetime
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -64,6 +65,12 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    algo: str = "SAC"
+    """the name of the algorithm"""
+    smoothness: str = "vanilla"
+    """the type of smoothness regularization (vanilla, caps, gradcaps, 2gradcaps, 3gradcaps, 4gradcaps)"""
+    lmd: float = 0.1
+    """the coefficient of the smoothness regularization"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -73,6 +80,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
@@ -101,7 +109,16 @@ class SoftQNetwork(nn.Module):
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
+eval_episodes = 10  # number of episodes to run for evaluation
+eval_every = 2500  # how often to evaluate the policy
+log_every = 1000  # how often to log results to tensorboard
+best_return = -1000
+best_smooth = 1000
 
+args = tyro.cli(Args)
+print(args)
+dt = datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")
+run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}"
 
 class Actor(nn.Module):
     def __init__(self, env):
@@ -150,11 +167,53 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
 
+def evaluate(agent):
+    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, 0, 0, args.capture_video, run_name)])
+
+    obs, _ = envs.reset()
+    episodic_returns = []
+    smooth_errors = []
+
+    last_action = None
+    current_error = []
+
+    while len(episodic_returns) < eval_episodes:
+        actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
+        actions = actions.detach().cpu().numpy()
+
+        # Track action difference for smoothness
+        if last_action is not None:
+            diff = np.abs(actions - last_action)
+            current_error.append(diff)
+        last_action = actions
+
+        next_obs, _, _, _, infos = envs.step(actions)
+
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if "episode" not in info:
+                    continue
+                # print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+                episodic_returns += [info["episode"]["r"]]
+
+                # Compute smooth metric for the episode
+                if current_error:
+                    episode_smoothness = np.mean(current_error)
+                    smooth_errors.append(episode_smoothness)
+                else:
+                    smooth_errors.append(0.0)  # No movement = perfectly smooth (or undefined)
+
+                # Reset for next episode
+                current_error = []
+                last_action = None
+
+        obs = next_obs
+
+    return episodic_returns, smooth_errors
+
 
 if __name__ == "__main__":
 
-    args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -167,7 +226,12 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+
+    project_dir = f"runs/{args.algo}/{run_name}"
+    os.makedirs(f"{project_dir}/weights", exist_ok=True)
+    os.system(f"cp cleanrl/{os.path.basename(__file__)} {project_dir}/")
+
+    writer = SummaryWriter(project_dir)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -236,7 +300,7 @@ if __name__ == "__main__":
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                    # print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                     break
@@ -303,7 +367,7 @@ if __name__ == "__main__":
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
+            if global_step % log_every == 0:
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
@@ -311,7 +375,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
+                # print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
@@ -319,6 +383,36 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+        
+        if (global_step > args.learning_starts) and (global_step % eval_every == 0):
+            returns, smooths = evaluate(actor)
+            
+            avg_return, std_return = np.mean(returns), np.std(returns)
+            avg_smooth, std_smooth = np.mean(smooths), np.std(smooths)
+
+            writer.add_scalar("eval/ep_reward", avg_return, global_step)
+            writer.add_scalar("eval/ep_reward_upper", np.max(returns), global_step)
+            writer.add_scalar("eval/ep_reward_lower", np.min(returns), global_step)
+            writer.add_scalar("eval/smooth_error", avg_smooth, global_step)
+            writer.add_scalar("eval/smooth_error_upper", np.max(smooths), global_step)
+            writer.add_scalar("eval/smooth_error_lower", np.min(smooths), global_step)
+
+            # save model
+            if (avg_return >= best_return):
+                if (avg_return == best_return and avg_smooth < best_smooth) or (avg_return > best_return):
+                    best_return = avg_return
+                    best_smooth = avg_smooth
+
+                    weights_path = f"{project_dir}/weights/best_reward-{best_return:.4f}_smooth-{best_smooth*100:.4f}.w"
+                    os.system(f"rm -f {project_dir}/weights/*")
+                    torch.save(actor, weights_path)
+                best_return = avg_return
+
+            perc = int(global_step / args.total_timesteps * 100)
+
+            print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%)  Avg Episode Reward {avg_return:10.3f} ± {std_return:5.3f}; {avg_smooth*100:10.3f} ± {std_smooth*100:5.3f}")
+            print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%) Best Episode Reward {best_return:10.3f} ± {0:05.3f}; {best_smooth*100:10.3f} ± {0:05.3f}")
+            print()
 
     envs.close()
     writer.close()
