@@ -1,5 +1,8 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+import re
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
 import time
 from datetime import datetime
@@ -39,12 +42,14 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = int(1e6)
     """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
+    optimize_memory_usage: bool = False
+    """toggle for optmizing memory usage (OMU) in the replay buffer"""
     gamma: float = 0.99
     """the discount factor gamma"""
     tau: float = 0.005
@@ -112,13 +117,13 @@ LOG_STD_MIN = -5
 eval_episodes = 10  # number of episodes to run for evaluation
 eval_every = 2500  # how often to evaluate the policy
 log_every = 1000  # how often to log results to tensorboard
-best_return = -1000
-best_smooth = 1000
+best_return = -10000
+best_smooth = 10000
 
 args = tyro.cli(Args)
 print(args)
 dt = datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")
-run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}"
+run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}__notOMU"
 
 class Actor(nn.Module):
     def __init__(self, env):
@@ -168,9 +173,10 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 def evaluate(agent):
+    agent.eval()
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, 0, 0, args.capture_video, run_name)])
 
-    obs, _ = envs.reset()
+    obs, _ = envs.reset(seed=0)
     episodic_returns = []
     smooth_errors = []
 
@@ -178,8 +184,9 @@ def evaluate(agent):
     current_error = []
 
     while len(episodic_returns) < eval_episodes:
-        actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
-        actions = actions.detach().cpu().numpy()
+        with torch.no_grad():
+            actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
+            actions = actions.detach().cpu().numpy()
 
         # Track action difference for smoothness
         if last_action is not None:
@@ -208,7 +215,7 @@ def evaluate(agent):
                 last_action = None
 
         obs = next_obs
-
+    agent.train()
     return episodic_returns, smooth_errors
 
 
@@ -227,9 +234,10 @@ if __name__ == "__main__":
             save_code=True,
         )
 
-    project_dir = f"runs/{args.algo}/{run_name}"
+    project_dir = f"runs/{args.algo}/{args.smoothness}/{run_name}"
     os.makedirs(f"{project_dir}/weights", exist_ok=True)
-    os.system(f"cp cleanrl/{os.path.basename(__file__)} {project_dir}/")
+    os.system(f"cp {os.path.basename(__file__)} {project_dir}/")
+    os.system(f"cp ../cleanrl_utils/buffers.py {project_dir}/")
 
     writer = SummaryWriter(project_dir)
     writer.add_text(
@@ -273,13 +281,25 @@ if __name__ == "__main__":
         alpha = args.alpha
 
     envs.single_observation_space.dtype = np.float32
+
+    def get_order(s: str) -> int:
+        if s == "gradcaps":
+            return 1
+        if match := re.fullmatch(r'(\d+)gradcaps', s):
+            return int(match.group(1))
+        return 0
+
+    caps_order = get_order(args.smoothness) #int(args.smoothness[0])+1
+    print("caps_order", caps_order)
     rb = ReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
         device,
         n_envs=args.num_envs,
+        optimize_memory_usage=args.optimize_memory_usage,
         handle_timeout_termination=False,
+        history_len=caps_order
     )
     start_time = time.time()
 
@@ -346,6 +366,104 @@ if __name__ == "__main__":
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
+                    def get_action(t):
+                        if t == 1:
+                            next_actions, _, _ = actor.get_action(data.next_observations)
+                            return next_actions
+                        if t == 0:
+                            return pi # current_actions
+
+                        actions, _, _ = actor.get_action(data.prev_observations[abs(t)-1])
+                        return actions
+
+
+                    def gradient(t, n):
+                        if n == 0:
+                            return get_action(t)
+
+                        return gradient(t, n-1) - gradient(t-1, n-1)
+
+                    # SMOOTHNESS PART
+                    caps_temporal_loss = 0
+                    if (args.smoothness == 'caps'):
+                        next_actions, _, _ = actor.get_action(data.next_observations)
+
+                        diff_normed = (next_actions - pi)
+                        caps_temporal_loss = torch.nn.functional.mse_loss(diff_normed, torch.zeros_like(diff_normed))
+
+                        # If you want to normalize by the batch size
+                        caps_temporal_loss = caps_temporal_loss / (pi.size(0))
+                    elif (args.smoothness == 'gradcaps'):
+                        prev_actions, _, _ = actor.get_action(data.prev_observations[0]) # t = -1
+                        next_actions, _, _ = actor.get_action(data.next_observations)
+                        diff_prev = pi - prev_actions
+                        diff_next = next_actions - pi
+
+                        displacement = torch.abs(next_actions - prev_actions).detach()
+
+                        grad_diff = diff_next - diff_prev
+                        norm_scaler = 1.0 / (displacement + 0.00001)
+
+                        norm_scaler = torch.tanh(norm_scaler)
+
+                        grad_normed = grad_diff * norm_scaler
+
+                        grad_loss = torch.nn.functional.mse_loss(grad_normed, torch.zeros_like(grad_normed))
+
+                        caps_temporal_loss = (grad_loss) / (pi.size(0))
+                    elif ('gradcaps' in args.smoothness):
+                        grad_normed, min_order = 0.0, 2
+
+                        # lmd = 0.1
+                        loss_weights = []
+                        for n in range(0, caps_order+1):
+                            loss_weights.append((1 - args.lmd)*np.power(args.lmd, n)) # lmd-0.05
+
+                        for idx, order in enumerate(range(min_order, caps_order+2)):
+                            grad_prev = gradient(0, order-1)
+                            grad_next = gradient(1, order-1)
+                            grad_diff = grad_prev - grad_next # default
+
+                            if order == 1:
+                                norm_scaler = 1
+                            else:
+                                # minmax_norm
+                                action_chain = [get_action(1-i) for i in range(0, caps_order+2)]
+                                minmax = None
+
+                                for act_idx in range(*envs.single_action_space.shape):
+                                    actions_t = None
+                                    for t_ in range(len(action_chain)):
+                                        # print(action_chain[t_].shape)
+                                        if actions_t is not None:
+                                            actions_t = torch.vstack((actions_t, action_chain[t_][:, act_idx]))
+                                        else:
+                                            actions_t = torch.unsqueeze(action_chain[t_][:, act_idx], 0)
+
+                                    actions_t = torch.reshape(actions_t, (actions_t.shape[1], actions_t.shape[0]))
+                                    # print(actions_t.shape)
+                                    mx = torch.max(actions_t, axis=1).values
+                                    mn = torch.min(actions_t, axis=1).values
+                                    if minmax is not None:
+                                        minmax = torch.vstack((minmax, mx-mn))
+                                    else:
+                                        minmax = torch.unsqueeze(mx-mn, 0)
+
+                                minmax = torch.reshape(minmax, (minmax.shape[1], minmax.shape[0]))
+                                displacement = torch.abs(minmax).detach() # minmax_norm
+
+                                norm_scaler = 1.0 / (displacement + 0.00001)
+                                norm_scaler = torch.tanh(norm_scaler)
+                            # print('loss_weights[idx]', loss_weights[idx])
+                            # print('grad_diff', grad_diff.shape)
+                            # print('norm_scaler', norm_scaler.shape)
+                            grad_normed += loss_weights[idx] * torch.abs(grad_diff * (norm_scaler))
+
+                        grad_loss = torch.nn.functional.mse_loss(grad_normed, torch.zeros_like(grad_normed))
+                        caps_temporal_loss = (grad_loss) / (pi.size(0))
+
+                    actor_loss += caps_temporal_loss
+
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
@@ -407,9 +525,11 @@ if __name__ == "__main__":
                     os.system(f"rm -f {project_dir}/weights/*")
                     torch.save(actor, weights_path)
                 best_return = avg_return
+                writer.add_scalar("eval/best_reward", best_return, 0)
+                writer.add_scalar("eval/best_smooth", best_smooth, 0)
 
             perc = int(global_step / args.total_timesteps * 100)
-
+            print(run_name)
             print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%)  Avg Episode Reward {avg_return:10.3f} ± {std_return:5.3f}; {avg_smooth*100:10.3f} ± {std_smooth*100:5.3f}")
             print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%) Best Episode Reward {best_return:10.3f} ± {0:05.3f}; {best_smooth*100:10.3f} ± {0:05.3f}")
             print()

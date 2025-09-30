@@ -59,6 +59,7 @@ class ReplayBufferSamples(NamedTuple):
     next_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
+    prev_observations: th.Tensor
 
 
 def get_action_dim(action_space: spaces.Space) -> int:
@@ -158,6 +159,7 @@ class BaseBuffer(ABC):
         action_space: spaces.Space,
         device: th.device | str = "auto",
         n_envs: int = 1,
+        history_len: int = 0,
     ):
         super().__init__()
         self.buffer_size = buffer_size
@@ -170,6 +172,7 @@ class BaseBuffer(ABC):
         self.full = False
         self.device = get_device(device)
         self.n_envs = n_envs
+        self.history_len = history_len
 
     @staticmethod
     def swap_and_flatten(arr: np.ndarray) -> np.ndarray:
@@ -221,7 +224,7 @@ class BaseBuffer(ABC):
         :return:
         """
         upper_bound = self.buffer_size if self.full else self.pos
-        batch_inds = np.random.randint(0, upper_bound, size=batch_size)
+        batch_inds = np.random.randint(self.history_len, upper_bound, size=batch_size)
         return self._get_samples(batch_inds)
 
     @abstractmethod
@@ -273,6 +276,7 @@ class ReplayBuffer(BaseBuffer):
     rewards: np.ndarray
     dones: np.ndarray
     timeouts: np.ndarray
+    history_len: int = 0
 
     def __init__(
         self,
@@ -283,8 +287,9 @@ class ReplayBuffer(BaseBuffer):
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
+        history_len: int = 0,
     ):
-        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs, history_len=history_len)
 
         # Adjust buffer size
         self.buffer_size = max(buffer_size // n_envs, 1)
@@ -391,7 +396,7 @@ class ReplayBuffer(BaseBuffer):
         if self.full:
             batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
         else:
-            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+            batch_inds = np.random.randint(self.history_len, self.pos, size=batch_size)
         return self._get_samples(batch_inds)
 
     def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
@@ -403,6 +408,21 @@ class ReplayBuffer(BaseBuffer):
         else:
             next_obs = self.next_observations[batch_inds, env_indices, :]
 
+        # Gather previous N observations
+        # previous_observations = np.zeros((len(batch_inds), history_len, *self.obs_shape), dtype=self.observation_space.dtype)
+
+        previous_observations = []
+        if self.history_len == 1:
+            previous_observations = self.observations[batch_inds - 1, env_indices, :].reshape(-1, 1, *self.obs_shape)
+        elif self.history_len > 1:
+            previous_observations = np.stack([
+                self.observations[batch_inds - i, env_indices, :] for i in range(1, self.history_len+1)
+            ], axis=0)
+
+        # for h in range(1, history_len + 1):
+        #     prev_inds = (batch_inds - h) % self.buffer_size
+        #     previous_observations[:, h - 1, :] = self.observations[prev_inds, env_indices, :]
+
         data = (
             self.observations[batch_inds, env_indices, :],
             self.actions[batch_inds, env_indices, :],
@@ -411,6 +431,7 @@ class ReplayBuffer(BaseBuffer):
             # deactivated by default (timeouts is initialized as an array of False)
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self.rewards[batch_inds, env_indices].reshape(-1, 1),
+            previous_observations
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
