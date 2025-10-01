@@ -3,6 +3,11 @@ import re
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import warnings
+warnings.filterwarnings('ignore')  # hides all warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import random
 import time
 from datetime import datetime
@@ -18,6 +23,8 @@ import tyro
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
+import math
+from tqdm.auto import tqdm
 
 
 @dataclass
@@ -76,6 +83,10 @@ class Args:
     """the type of smoothness regularization (vanilla, caps, gradcaps, 2gradcaps, 3gradcaps, 4gradcaps)"""
     lmd: float = 0.1
     """the coefficient of the smoothness regularization"""
+    reg_coeff: float = 1.0
+    """the weight of the smoothness regularization loss"""
+    notes: str = ""
+    """notes about the experiment"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -123,7 +134,9 @@ best_smooth = 10000
 args = tyro.cli(Args)
 print(args)
 dt = datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")
-run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}__notOMU"
+run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-reg_coeff{args.reg_coeff}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}__minmax"
+print()
+print(run_name)
 
 class Actor(nn.Module):
     def __init__(self, env):
@@ -291,6 +304,12 @@ if __name__ == "__main__":
 
     caps_order = get_order(args.smoothness) #int(args.smoothness[0])+1
     print("caps_order", caps_order)
+    # lmd = 0.1
+    loss_weights = []
+    for n in range(0, caps_order+1):
+        loss_weights.append((1 - args.lmd)*np.power(args.lmd, n)) # lmd-0.05
+    print("loss_weights", loss_weights)
+
     rb = ReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
@@ -305,7 +324,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    for global_step in (pbar := tqdm(range(args.total_timesteps))):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -366,23 +385,6 @@ if __name__ == "__main__":
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-                    def get_action(t):
-                        if t == 1:
-                            next_actions, _, _ = actor.get_action(data.next_observations)
-                            return next_actions
-                        if t == 0:
-                            return pi # current_actions
-
-                        actions, _, _ = actor.get_action(data.prev_observations[abs(t)-1])
-                        return actions
-
-
-                    def gradient(t, n):
-                        if n == 0:
-                            return get_action(t)
-
-                        return gradient(t, n-1) - gradient(t-1, n-1)
-
                     # SMOOTHNESS PART
                     caps_temporal_loss = 0
                     if (args.smoothness == 'caps'):
@@ -410,57 +412,58 @@ if __name__ == "__main__":
 
                         grad_loss = torch.nn.functional.mse_loss(grad_normed, torch.zeros_like(grad_normed))
 
-                        caps_temporal_loss = (grad_loss) / (pi.size(0))
+                        caps_temporal_loss = (args.reg_coeff * grad_loss) / (pi.size(0))
                     elif ('gradcaps' in args.smoothness):
-                        grad_normed, min_order = 0.0, 2
+                        def get_action(t):
+                            if t == 1:
+                                next_actions, _, _ = actor.get_action(data.next_observations)
+                                return next_actions
+                            if t == 0:
+                                return pi # current_actions
 
-                        # lmd = 0.1
-                        loss_weights = []
-                        for n in range(0, caps_order+1):
-                            loss_weights.append((1 - args.lmd)*np.power(args.lmd, n)) # lmd-0.05
+                            actions, _, _ = actor.get_action(data.prev_observations[abs(t)-1])
+                            return actions
+                        action_chain = [get_action(1-i) for i in range(0, caps_order+2)]
 
-                        for idx, order in enumerate(range(min_order, caps_order+2)):
-                            grad_prev = gradient(0, order-1)
-                            grad_next = gradient(1, order-1)
-                            grad_diff = grad_prev - grad_next # default
+                        minmax = None
+                        for act_idx in range(*envs.single_action_space.shape):
+                            actions_t = None
+                            for t_ in range(len(action_chain)):
+                                if actions_t is not None:
+                                    actions_t = torch.vstack((actions_t, action_chain[t_][:, act_idx]))
+                                else:
+                                    actions_t = torch.unsqueeze(action_chain[t_][:, act_idx], 0)
 
-                            if order == 1:
-                                norm_scaler = 1
+                            actions_t = torch.reshape(actions_t, (actions_t.shape[1], actions_t.shape[0]))
+                            mx = torch.max(actions_t, axis=1).values
+                            mn = torch.min(actions_t, axis=1).values
+                            if minmax is not None:
+                                minmax = torch.vstack((minmax, mx-mn))
                             else:
-                                # minmax_norm
-                                action_chain = [get_action(1-i) for i in range(0, caps_order+2)]
-                                minmax = None
+                                minmax = torch.unsqueeze(mx-mn, 0)
 
-                                for act_idx in range(*envs.single_action_space.shape):
-                                    actions_t = None
-                                    for t_ in range(len(action_chain)):
-                                        # print(action_chain[t_].shape)
-                                        if actions_t is not None:
-                                            actions_t = torch.vstack((actions_t, action_chain[t_][:, act_idx]))
-                                        else:
-                                            actions_t = torch.unsqueeze(action_chain[t_][:, act_idx], 0)
+                        minmax = torch.reshape(minmax, (minmax.shape[1], minmax.shape[0]))
+                        displacement = torch.abs(minmax).detach() # minmax_norm
 
-                                    actions_t = torch.reshape(actions_t, (actions_t.shape[1], actions_t.shape[0]))
-                                    # print(actions_t.shape)
-                                    mx = torch.max(actions_t, axis=1).values
-                                    mn = torch.min(actions_t, axis=1).values
-                                    if minmax is not None:
-                                        minmax = torch.vstack((minmax, mx-mn))
-                                    else:
-                                        minmax = torch.unsqueeze(mx-mn, 0)
+                        norm_scaler = 1.0 / (displacement + 0.00001)
+                        norm_scaler = torch.tanh(norm_scaler)
+                        
+                        def grad_diff(n):
+                            result = 0.0
+                            for k in range(n + 2):
+                                sign = (-1) ** k
+                                binom = math.comb(n+1, k)
+                                result += sign * binom * action_chain[k]
 
-                                minmax = torch.reshape(minmax, (minmax.shape[1], minmax.shape[0]))
-                                displacement = torch.abs(minmax).detach() # minmax_norm
+                            return result
 
-                                norm_scaler = 1.0 / (displacement + 0.00001)
-                                norm_scaler = torch.tanh(norm_scaler)
-                            # print('loss_weights[idx]', loss_weights[idx])
-                            # print('grad_diff', grad_diff.shape)
-                            # print('norm_scaler', norm_scaler.shape)
-                            grad_normed += loss_weights[idx] * torch.abs(grad_diff * (norm_scaler))
+                        grad_normed = 0.0
+                        for i in range(1, caps_order+1):
+                            grad_normed += loss_weights[i-1] * grad_diff(i)
 
+                        grad_normed *= norm_scaler
                         grad_loss = torch.nn.functional.mse_loss(grad_normed, torch.zeros_like(grad_normed))
-                        caps_temporal_loss = (grad_loss) / (pi.size(0))
+                        caps_temporal_loss = (args.reg_coeff * grad_loss) / (pi.size(0))
 
                     actor_loss += caps_temporal_loss
 
@@ -509,9 +512,11 @@ if __name__ == "__main__":
             avg_smooth, std_smooth = np.mean(smooths), np.std(smooths)
 
             writer.add_scalar("eval/ep_reward", avg_return, global_step)
+            writer.add_scalar("eval/ep_reward_std", std_return, global_step)
             writer.add_scalar("eval/ep_reward_upper", np.max(returns), global_step)
             writer.add_scalar("eval/ep_reward_lower", np.min(returns), global_step)
             writer.add_scalar("eval/smooth_error", avg_smooth, global_step)
+            writer.add_scalar("eval/smooth_error_std", std_smooth, global_step)
             writer.add_scalar("eval/smooth_error_upper", np.max(smooths), global_step)
             writer.add_scalar("eval/smooth_error_lower", np.min(smooths), global_step)
 
@@ -529,10 +534,11 @@ if __name__ == "__main__":
                 writer.add_scalar("eval/best_smooth", best_smooth, 0)
 
             perc = int(global_step / args.total_timesteps * 100)
-            print(run_name)
-            print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%)  Avg Episode Reward {avg_return:10.3f} ± {std_return:5.3f}; {avg_smooth*100:10.3f} ± {std_smooth*100:5.3f}")
-            print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%) Best Episode Reward {best_return:10.3f} ± {0:05.3f}; {best_smooth*100:10.3f} ± {0:05.3f}")
-            print()
+            # print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%)  Avg Episode Reward {avg_return:10.3f} ± {std_return:5.3f}; {avg_smooth*100:10.3f} ± {std_smooth*100:5.3f}")
+            # print(f"Env step {global_step:8d} / {args.total_timesteps} ({perc:2d}%) Best Episode Reward {best_return:10.3f} ± {0:05.3f}; {best_smooth*100:10.3f} ± {0:05.3f}")
+            # print()
+
+            pbar.set_description(f"Step {global_step:8d}: {avg_return:10.3f} ± {std_return:5.3f}; {avg_smooth*100:10.3f} ± {std_smooth*100:5.3f} | Best = {best_return:5.3f} ± {0:05.3f}; {best_smooth*100:10.3f} ± {0:05.3f} ###")
 
     envs.close()
     writer.close()
