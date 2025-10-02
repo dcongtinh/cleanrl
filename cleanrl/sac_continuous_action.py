@@ -131,12 +131,13 @@ log_every = 1000  # how often to log results to tensorboard
 best_return = -10000
 best_smooth = 10000
 
-args = tyro.cli(Args)
-print(args)
-dt = datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")
-run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-reg_coeff{args.reg_coeff}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}__minmax"
-print()
-print(run_name)
+try:
+    args = tyro.cli(Args)
+    print(args)
+    dt = datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")
+    run_name = f"{args.algo}-{args.smoothness}-lmd{args.lmd}-reg_coeff{args.reg_coeff}-{args.env_id.split('/')[-1]}-seed{args.seed}-{dt}__minmax"
+except:
+    pass
 
 class Actor(nn.Module):
     def __init__(self, env):
@@ -247,6 +248,9 @@ if __name__ == "__main__":
             save_code=True,
         )
 
+
+    print()
+    print(run_name)
     project_dir = f"runs/{args.algo}/{args.smoothness}/{run_name}"
     os.makedirs(f"{project_dir}/weights", exist_ok=True)
     os.system(f"cp {os.path.basename(__file__)} {project_dir}/")
